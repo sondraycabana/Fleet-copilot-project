@@ -6,6 +6,7 @@ from services.audit_service import AuditService
 import httpx
 import os
 import json
+import traceback
 
 router = APIRouter(prefix="/api/v1/copilot", tags=["Fleet Copilot Core"])
 audit = AuditService()
@@ -39,6 +40,7 @@ async def process_copilot_query(
         rejection_text = "Security Alert: The requested operation has been blocked by the security layer. Cross-company tenant access queries are strictly forbidden on this platform."
         return ChatResponse(session_id=session_id, response=rejection_text, requires_approval=False, staged_proposals=[], gathered_evidence=[])
 
+    # Initialized variables matching the graph.py expectations precisely
     initial_state = {
         "messages": [request.message],
         "company_context": str(x_company_id),
@@ -46,6 +48,7 @@ async def process_copilot_query(
         "gathered_evidence": [],
         "staged_proposals": [],
         "requires_approval": False,
+        "response_text": "",
         "current_agent_turn": "planner_node"
     }
     
@@ -53,6 +56,16 @@ async def process_copilot_query(
         # EXECUTE NATIVE LANGGRAPH LOOP AGENT INVOCATION
         output_state = fleet_copilot_graph.invoke(initial_state)
         
+        # Intercept and return programmatic short-circuit rejections if present
+        if output_state.get("response_text") and "Refused Action" in str(output_state.get("response_text")):
+            return ChatResponse(
+                session_id=session_id,
+                response=str(output_state["response_text"]),
+                requires_approval=False,
+                staged_proposals=[],
+                gathered_evidence=[]
+            )
+            
         evidence = output_state.get("gathered_evidence", [])
         staged = output_state.get("staged_proposals", [])
         
@@ -60,7 +73,7 @@ async def process_copilot_query(
             for p in staged:
                 audit.log_event(x_company_id, x_operator_id, p["action_type"], "STAGED", p)
 
-        # OpenRouter Response Generation
+        # OpenRouter Direct Response Generation Pass
         api_key = os.getenv("OPENAI_API_KEY")
         base_url = os.getenv("OPENAI_BASE_URL", "https://openrouter.ai")
         
@@ -105,7 +118,8 @@ async def process_copilot_query(
             gathered_evidence=evidence
         )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"LangGraph execution loop failed: {str(e)}")
+        tb_str = "".join(traceback.format_exception(type(e), e, e.__traceback__))
+        raise HTTPException(status_code=500, detail=f"CRASH TRACEBACK:\n{tb_str}")
 
 @router.post("/action/approve")
 async def execute_staged_action(request: ApprovalRequest, x_company_id: str = Header(...), x_operator_id: str = Header(...)):
